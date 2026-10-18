@@ -1,0 +1,232 @@
+# PIPELINE 2 - run as many times as you like. Needs pipeline 1 to have run once.
+# Pick everything with the run-time options below.
+trigger: none
+pr: none
+
+parameters:
+- name: action
+  displayName: 'Action'
+  type: string
+  default: create
+  values:
+  - create              # create / update VMs to match the counts below
+  - destroy-vms         # delete all VMs + their network (keeps gallery, images, state storage)
+  - destroy-everything  # delete VMs AND gallery, images and Terraform state storage
+- name: ubuntuCount
+  displayName: 'Number of Ubuntu VMs (0 = none)'
+  type: number
+  default: 1
+  values: [0, 1, 2, 3, 4, 5]
+- name: windowsCount
+  displayName: 'Number of Windows VMs (0 = none)'
+  type: number
+  default: 1
+  values: [0, 1, 2, 3, 4, 5]
+- name: vmSize
+  displayName: 'VM size'
+  type: string
+  default: 'Standard_D2s_v3'
+- name: imageVersion
+  displayName: 'Image version ("latest" or e.g. 1.0.123)'
+  type: string
+  default: 'latest'
+- name: allowedSourceCidr
+  displayName: 'Allowed source IP for SSH/RDP/HTTP (your IP/32, or * for anywhere)'
+  type: string
+  default: '*'
+
+# NOTE: keep these in sync with pipelines/1-build-images.yml
+variables:
+  azureServiceConnection: 'azure-sub-conn'
+  location: 'uaenorth'
+  galleryRg: 'rg-imagefactory'
+  galleryName: 'acg_imagefactory'
+  tfStateRg: 'rg-tfstate'
+  tfStateContainer: 'tfstate'
+  tfStateKey: 'imagelab.tfstate'
+  terraformVersion: '1.9.8'
+
+stages:
+# ===================== PLAN =====================
+- stage: Plan
+  displayName: 'Terraform plan (${{ parameters.action }})'
+  jobs:
+  - job: Plan
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+
+    - script: |
+        set -e
+        curl -fsSL -o /tmp/tf.zip \
+          https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+        sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+        terraform version
+      displayName: 'Install Terraform $(terraformVersion)'
+
+    - task: AzureCLI@2
+      displayName: 'Pre-flight checks'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          source scripts/common.sh
+
+          if ! az storage account show -g "$(tfStateRg)" -n "$TFSTATE_SA" -o none 2>/dev/null; then
+            echo "##vso[task.logissue type=error]Terraform state storage not found. Run pipeline 1 (1-build-images.yml) first."
+            exit 1
+          fi
+
+          if [ "${{ parameters.action }}" = "create" ]; then
+            if [ "${{ parameters.ubuntuCount }}" = "0" ] && [ "${{ parameters.windowsCount }}" = "0" ]; then
+              echo "##vso[task.logissue type=error]Both VM counts are 0. Choose at least one VM, or use a destroy action."
+              exit 1
+            fi
+            check_image () {  # definition-name  count  label
+              if [ "$2" != "0" ]; then
+                N=$(az sig image-version list -g "$(galleryRg)" -r "$(galleryName)" -i "$1" --query "length(@)" -o tsv 2>/dev/null || echo 0)
+                if [ "${N:-0}" = "0" ]; then
+                  echo "##vso[task.logissue type=error]No $3 image versions in the gallery. Run pipeline 1 first."
+                  exit 1
+                fi
+                echo "$3 image versions available: $N"
+              fi
+            }
+            check_image ubuntu-2404  "${{ parameters.ubuntuCount }}"  Ubuntu
+            check_image windows-2025 "${{ parameters.windowsCount }}" Windows
+          fi
+
+    - task: AzureCLI@2
+      displayName: 'Terraform init / validate / plan'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        addSpnToEnvironment: true
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          source scripts/common.sh
+          cd terraform
+          export TF_DATA_DIR=$(Agent.TempDirectory)/tfdata   # keep .terraform out of the artifact
+
+          terraform init -input=false \
+            -backend-config="resource_group_name=$(tfStateRg)" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(tfStateKey)"
+
+          terraform validate
+
+          if [ "${{ parameters.action }}" = "create" ]; then
+            terraform plan -input=false -var-file=lab.tfvars -out=tfplan
+          else
+            # Destroy removes everything in state; zero counts avoid needing images to exist.
+            export TF_VAR_ubuntu_count=0
+            export TF_VAR_windows_count=0
+            terraform plan -destroy -input=false -var-file=lab.tfvars -out=tfplan
+          fi
+      env:
+        TF_VAR_location: $(location)
+        TF_VAR_gallery_resource_group: $(galleryRg)
+        TF_VAR_gallery_name: $(galleryName)
+        TF_VAR_ubuntu_count: ${{ parameters.ubuntuCount }}
+        TF_VAR_windows_count: ${{ parameters.windowsCount }}
+        TF_VAR_vm_size: ${{ parameters.vmSize }}
+        TF_VAR_image_version: ${{ parameters.imageVersion }}
+        TF_VAR_allowed_source_cidr: '${{ parameters.allowedSourceCidr }}'
+
+    # NOTE: the plan file contains the generated admin password. Keep project access restricted.
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish plan'
+      inputs:
+        targetPath: terraform
+        artifact: tfplan
+
+# ===================== APPLY (approval gate) =====================
+# Optional: Pipelines > Environments > image-lab > Approvals and checks > add an approver.
+- stage: Apply
+  displayName: 'Terraform apply (${{ parameters.action }})'
+  dependsOn: Plan
+  condition: succeeded()
+  jobs:
+  - deployment: Apply
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'image-lab'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - script: |
+              set -e
+              curl -fsSL -o /tmp/tf.zip \
+                https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+              sudo unzip -o /tmp/tf.zip -d /usr/local/bin
+              terraform version
+            displayName: 'Install Terraform $(terraformVersion)'
+
+          - task: AzureCLI@2
+            displayName: 'Terraform apply'
+            inputs:
+              azureSubscription: ${{ variables.azureServiceConnection }}
+              addSpnToEnvironment: true
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(Pipeline.Workspace)/tfplan
+              inlineScript: |
+                set -e
+                SUB_ID=$(az account show --query id -o tsv)
+                export ARM_SUBSCRIPTION_ID="$SUB_ID"
+                TFSTATE_SA="tf$(printf '%s' "$SUB_ID" | md5sum | cut -c1-16)"   # same formula as scripts/common.sh
+                # Terraform cannot use `az login` as a service principal: pass the credentials explicitly
+                if [ -n "${servicePrincipalId:-}" ]; then
+                  export ARM_CLIENT_ID="$servicePrincipalId"
+                  export ARM_TENANT_ID="$tenantId"
+                  if [ -n "${servicePrincipalKey:-}" ]; then
+                    export ARM_CLIENT_SECRET="$servicePrincipalKey"
+                  else
+                    export ARM_USE_OIDC=true
+                    export ARM_OIDC_TOKEN="${idToken:-}"
+                  fi
+                fi
+                export TF_DATA_DIR=$(Agent.TempDirectory)/tfdata
+
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$(tfStateRg)" \
+                  -backend-config="storage_account_name=$TFSTATE_SA" \
+                  -backend-config="container_name=$(tfStateContainer)" \
+                  -backend-config="key=$(tfStateKey)"
+
+                terraform apply -input=false tfplan
+
+                if [ "${{ parameters.action }}" = "create" ]; then
+                  terraform output
+                  echo "=========== LAB CREDENTIALS (printed for convenience; do not do this in real environments) ==========="
+                  echo "Username: $(terraform output -raw admin_username)"
+                  echo "Password: $(terraform output -raw admin_password)"
+                  echo "======================================================================================================"
+                fi
+
+# ===================== DELETE EVERYTHING (destroy-everything only) =====================
+- stage: DeleteInfra
+  displayName: 'Delete gallery + state storage'
+  dependsOn: Apply
+  condition: and(succeeded(), eq('${{ parameters.action }}', 'destroy-everything'))
+  jobs:
+  - job: Delete
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Delete resource groups'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -e
+          az group delete -n $(galleryRg) --yes
+          az group delete -n $(tfStateRg) --yes

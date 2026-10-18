@@ -1,0 +1,98 @@
+# PIPELINE 1 - run ONCE (or whenever you want a new image version).
+# Creates RGs, gallery, image definitions, tfstate storage, then builds images with Packer.
+# Prerequisite: an Azure Resource Manager service connection with Contributor on the subscription.
+trigger: none
+pr: none
+
+parameters:
+- name: buildUbuntu
+  displayName: 'Build Ubuntu 24.04 image'
+  type: boolean
+  default: true
+- name: buildWindows
+  displayName: 'Build Windows Server 2025 image'
+  type: boolean
+  default: true
+
+# NOTE: keep these in sync with pipelines/2-deploy-vms.yml
+variables:
+  azureServiceConnection: 'azure-sub-conn'
+  location: 'uaenorth'
+  galleryRg: 'rg-imagefactory'
+  galleryName: 'acg_imagefactory'
+  tfStateRg: 'rg-tfstate'
+  tfStateContainer: 'tfstate'
+  packerVersion: '1.11.2'
+  imageVersion: '1.0.$(Build.BuildId)'
+
+stages:
+# ===================== BOOTSTRAP (idempotent) =====================
+- stage: Bootstrap
+  displayName: 'Bootstrap Azure resources'
+  jobs:
+  - job: Bootstrap
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: 'Create RGs, gallery, image definitions, tfstate storage'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: scriptPath
+        scriptPath: scripts/bootstrap.sh
+      env:
+        LOCATION: $(location)
+        GALLERY_RG: $(galleryRg)
+        GALLERY_NAME: $(galleryName)
+        TFSTATE_RG: $(tfStateRg)
+        TFSTATE_CONTAINER: $(tfStateContainer)
+
+# ===================== PACKER IMAGES =====================
+- stage: Images
+  displayName: 'Build images (Packer)'
+  dependsOn: Bootstrap
+  condition: and(succeeded(), or(eq('${{ parameters.buildUbuntu }}', 'true'), eq('${{ parameters.buildWindows }}', 'true')))
+  jobs:
+  - job: Build
+    timeoutInMinutes: 120
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      matrix:
+        ${{ if eq(parameters.buildUbuntu, true) }}:
+          ubuntu:
+            imgSource: 'ubuntu.azure-arm.ubuntu'
+        ${{ if eq(parameters.buildWindows, true) }}:
+          windows:
+            imgSource: 'windows.azure-arm.windows'
+    steps:
+    - checkout: self
+
+    - script: |
+        set -e
+        curl -fsSL -o /tmp/packer.zip \
+          https://releases.hashicorp.com/packer/$(packerVersion)/packer_$(packerVersion)_linux_amd64.zip
+        sudo unzip -o /tmp/packer.zip -d /usr/local/bin
+        packer version
+      displayName: 'Install Packer $(packerVersion)'
+
+    - task: AzureCLI@2
+      displayName: 'Packer build $(imgSource) -> $(imageVersion)'
+      inputs:
+        azureSubscription: ${{ variables.azureServiceConnection }}
+        scriptType: bash
+        scriptLocation: inlineScript
+        workingDirectory: packer
+        inlineScript: |
+          set -e
+          export PKR_VAR_subscription_id=$(az account show --query id -o tsv)
+          packer init .
+          packer validate -only=$(imgSource) .
+          packer build -color=false -only=$(imgSource) .
+      env:
+        PKR_VAR_location: $(location)
+        PKR_VAR_gallery_resource_group: $(galleryRg)
+        PKR_VAR_gallery_name: $(galleryName)
+        PKR_VAR_image_version: $(imageVersion)
